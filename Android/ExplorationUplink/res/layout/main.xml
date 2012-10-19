@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+
+<RelativeLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="fill_parent"
+    android:layout_height="fill_parent" >
+    
+<LinearLayout 
+    android:orientation="vertical"
+    android:layout_width="fill_parent"
+    android:layout_height="fill_parent"
+    >
+<TextView 
+android:layout_width="fill_parent" 
+android:layout_height="wrap_content"
+android:maxLines="14" 
+android:scrollbars = "vertical"
+android:text="WHURRRRR" android:id="@+id/txtbox"/>
+    
+    <SurfaceView
+        android:layout_width="fill_parent"
+        android:layout_height="fill_parent"
+        android:layout_weight="1" android:id="@+id/imgbox">
+    </SurfaceView>
+</LinearLayout>
+
+<TextView
+android:layout_width="fill_parent"
+android:layout_height="fill_parent"
+android:text="Debug Text"
+android:id="@+id/debug_text"
+android:layout_marginTop="60px"
+android:layout_marginLeft="0px"
+/>
+
+</RelativeLayout>

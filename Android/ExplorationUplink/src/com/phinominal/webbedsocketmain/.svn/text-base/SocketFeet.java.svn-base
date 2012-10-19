@@ -1,0 +1,218 @@
+package com.phinominal.webbedsocketmain;
+
+import java.io.IOException;
+
+import org.json.JSONException;
+
+import re.anywhere.client.GetIPs;
+import re.serialout.AudioSerialOutMono;
+import android.app.Activity;
+import android.graphics.PixelFormat;
+import android.hardware.Camera;
+import android.os.Bundle;
+import android.util.Log;
+import android.view.Menu;
+import android.view.MotionEvent;
+import android.view.SurfaceView;
+import android.view.View;
+import android.view.View.OnClickListener;
+import android.view.View.OnTouchListener;
+import android.view.Window;
+import android.widget.TextView;
+
+import com.openrobot.common.CameraPreviewFeed;
+import com.openrobot.common.ControlWebSocketServer;
+import com.openrobot.common.ControlWebSocketServerInterface;
+import com.openrobot.common.JSONMessage;
+import com.openrobot.common.VideoWebSocketServer;
+
+public class SocketFeet extends Activity implements ControlWebSocketServerInterface {
+
+	public ControlWebSocketServer controlWebSocketServer;
+	private VideoWebSocketServer videoWebSocketServer;
+	private static SurfaceView mSurfaceView;
+	public static TextView TextHUD;
+	public static float touchx, touchy;
+	private RobotOperations re; 
+	static final String appname = "Exploration Uplink";
+	
+	
+	private int currPanPosition = 127;
+	private int currTiltPosition = 127;
+	public static int CAMERA_POSITION_INCREMENT_AMOUNT = 2;
+	public static final String COMMAND_PREFIX = "s";
+	public static final String PAN_SERVO_ID = "c";
+	public static final String TILT_SERVO_ID = "b";
+	
+	/** Called when the activity is first created. */
+	@Override
+	public void onCreate(Bundle savedInstanceState) {
+		super.onCreate(savedInstanceState);
+
+		String ipadds = GetIPs.getAllIpAddress(",");
+		Log.d("OUT", appname + "   (found IPs:  "+ ipadds + ")");
+
+		Window lWin = getWindow();
+		lWin.setFormat(PixelFormat.TRANSLUCENT);
+
+		requestWindowFeature(Window.FEATURE_NO_TITLE);
+		// i want to see battery and gps status
+		//		lWin.setFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN,WindowManager.LayoutParams.FLAG_FULLSCREEN);
+
+		setContentView(R.layout.main);
+
+		mSurfaceView = (SurfaceView) findViewById(R.id.imgbox);
+		TextHUD = (TextView) findViewById(R.id.txtbox);
+
+		mSurfaceView.setOnClickListener(new OnClickListener() {
+			public void onClick(View aView) {
+				System.out.println("Surface view was clicked");
+			}
+		});
+
+/*
+ // not needed right now
+		mSurfaceView.setOnTouchListener(new OnTouchListener() {
+			@Override
+			public boolean onTouch(View v, MotionEvent event) {
+				if (event.getAction() == MotionEvent.ACTION_DOWN)
+				{
+					touchx = event.getRawX();
+					touchy = event.getRawY();
+					Log.d("OUT", "SurfaceView was touched at " + touchx + "___" + touchy);
+
+				}
+				return false;
+			}
+		});
+*/
+
+		TextHUD.setText(appname + " Found IPs :"+ ipadds);
+
+		int videoPort = 8886;
+		videoWebSocketServer = new VideoWebSocketServer(videoPort, mSurfaceView);
+		videoWebSocketServer.start();
+		Log.d("OUT", "VideoWebSocketServer started on port: " + videoWebSocketServer.getPort());
+
+		CameraPreviewFeed.Torch(true);
+		int controlPort = 8887;
+		controlWebSocketServer = new ControlWebSocketServer(controlPort, this);
+		controlWebSocketServer.start();
+		Log.d("OUT", "ControlWebSocketServer started on port: " + controlWebSocketServer.getPort());    
+
+		AudioSerialOutMono.activate();
+		AudioSerialOutMono.new_baudRate = 4800;
+		AudioSerialOutMono.new_characterdelay = 1;
+		AudioSerialOutMono.UpdateParameters(true);
+		re = new RobotOperations(this, controlWebSocketServer); // hardware related stuff goes in here
+		re.activate(true, true, true, 5); // turn on gps, HPR and audio
+		re.hprspam=true;
+
+	}   
+
+	@Override
+	public void onDestroy() {
+
+		try {
+			if (videoWebSocketServer != null) {
+				videoWebSocketServer.stop();
+			}
+			if (controlWebSocketServer != null) {
+				controlWebSocketServer.stop();
+			}
+		} catch (IOException e) {
+			// TODO Auto-generated catch block
+			e.printStackTrace();
+		}
+		super.onDestroy();
+	}
+
+	// ControlWebSocketServerInterface
+	public void controlInstructionReceived(String controlString) {
+		
+		String controlValue = "";
+		String controlAttribute = "";
+		try {
+			
+			// options seem to be: pan_control, tilt_control, 
+			// {"CONTROL_ATTRIBUTE_KEY": "direction_control", "CONTROL_VALUE_KEY": "J2\r"}
+			JSONMessage jsonMessage = new JSONMessage(controlString);
+			
+			controlAttribute = jsonMessage.getStringForKey(JSONMessage.CONTROL_ATTRIBUTE_KEY);
+			controlValue = jsonMessage.getStringForKey(JSONMessage.CONTROL_VALUE_KEY);
+			
+			Log.i(controlAttribute,controlValue);
+
+			if (controlAttribute.equalsIgnoreCase(JSONMessage.PAN_CONTROL_KEY)) {
+				int panChangeValue = jsonMessage.getIntForKey(JSONMessage.CONTROL_VALUE_KEY);
+				int newValue = currPanPosition += panChangeValue;
+				if (newValue < 1) {
+					newValue = 1;
+				} else if (newValue > 254) {
+					newValue = 254;
+				}
+				this.currPanPosition = newValue;
+				String panInstruction = COMMAND_PREFIX + PAN_SERVO_ID + newValue + "\r";
+				re.ExecuteCommand(panInstruction);
+				System.out.println(panInstruction);
+				return; 
+			} else if (controlAttribute.equalsIgnoreCase(JSONMessage.TILT_CONTROL_KEY)) {
+				int tiltChangeValue = jsonMessage.getIntForKey(JSONMessage.CONTROL_VALUE_KEY);
+				int newValue = currTiltPosition += tiltChangeValue;
+				if (newValue < 1) {
+					newValue = 1;
+				} else if (newValue > 254) {
+					newValue = 254;
+				}
+				this.currTiltPosition = newValue;
+				String tiltInstruction = COMMAND_PREFIX + TILT_SERVO_ID + newValue + "\r";
+				re.ExecuteCommand(tiltInstruction);
+				System.out.println(tiltInstruction);
+				return;
+			}
+			
+			System.out.println("Control Value:  " + controlValue);
+			
+		} catch (JSONException e) {
+			System.out.println(e);
+		}
+	
+		if (controlString == null) {
+			return;
+		}
+		
+		if (controlValue.startsWith("resetPan")) {
+			re.ExecuteCommand(PAN_SERVO_ID + 127 + "\r");
+			//send(re.ExecuteCommand(PAN_SERVO_ID + 127 + "\r"));
+		}
+		if (controlValue.startsWith("resetTilt")) {
+			re.ExecuteCommand(TILT_SERVO_ID + 127 + "\r");
+			//send(re.ExecuteCommand(TILT_SERVO_ID + 127 + "\r"));
+		}
+		
+		if (controlValue.startsWith("flashlight,1"))
+			CameraPreviewFeed.Torch(true);
+		if (controlValue.startsWith("flashlight,0"))
+			CameraPreviewFeed.Torch(false);
+		if (controlValue.startsWith("quit")) {
+			nuketheapp();
+			
+		} else { // command relating to external hardware or navigation: keep it in its own file. NOTHING ELSE SHOULD GO IN THERE.
+			if (!AudioSerialOutMono.isPlaying()) {
+				re.ExecuteCommand(controlValue);	
+			}
+		}
+	}
+
+	private void broadcast(String msg) 
+	{
+		try{controlWebSocketServer.sendToAll(msg);}catch(Exception e){};
+	}
+
+
+	// menu crap: just removes the application
+	public void nuketheapp(){re.setBright(1.0);android.os.Process.killProcess(android.os.Process.myPid());this.finish();}
+	public boolean onPrepareOptionsMenu(Menu menu) {nuketheapp();return true;}
+
+
+}

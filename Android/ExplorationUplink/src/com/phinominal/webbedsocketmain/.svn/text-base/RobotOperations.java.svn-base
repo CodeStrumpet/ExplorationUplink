@@ -1,0 +1,1731 @@
+
+package com.phinominal.webbedsocketmain;
+
+import java.io.FileWriter;
+
+import com.openrobot.common.ControlWebSocketServer;
+
+import re.serialout.AudioSerialOutMono;
+import android.content.Context;
+import android.hardware.Sensor;
+import android.hardware.SensorEvent;
+import android.hardware.SensorEventListener;
+import android.hardware.SensorManager;
+import android.location.Location;
+import android.location.LocationListener;
+import android.location.LocationManager;
+import android.media.AudioManager;
+import android.media.ToneGenerator;
+import android.os.Bundle;
+import android.os.Vibrator;
+import android.util.Log;
+import android.view.WindowManager;
+
+public class RobotOperations implements SensorEventListener, LocationListener {
+
+	// constants
+	static public final char cr = (char) 13; // because i don't want to type that in every time
+	static public final char lf = (char) 10; // because i don't want to type that in every time
+	static public final double base10 = 1.0 / Math.log(10); // used for rounding
+
+
+	// navigational data etc. here
+	public String nmeastring = "";
+	public char phoneorientation = 'H';
+	public double navlat,navlon,navalt,navbrg,navspd,navtim = 0;
+	public double h,p,r = 0;
+	public double headingadjust = 90.0;
+	public boolean validfix,gpson,hpron,audioon = false;
+	public boolean hprspam,locspam = false;
+	public int joypulse = 5;
+	public int joypulse_when_auto = 0;
+	public int curpulse = -1;
+	static public FileWriter serialdata_out = null;
+
+
+	private boolean autoheading_turn = false; // level 1: aim
+	private boolean autoheading_movement = false; // level 2: steer
+	private boolean autoheading_navigation = false; // level 3: navigate
+	private double wantedheading = 0;
+	private double headingtolerance = 5.0;
+	
+	public boolean outputH,outputB,outputA=true;
+
+	// internals
+	private double tv0,tv1,tv2,tv3,tv4,tv5; // none of these survive a function; static declaration for efficiency
+	private double goodheadings = 0; // hysteresis for autoheading_turn
+	static private SensorManager mCompassManager = null;
+	static private LocationManager mLocationManager = null;
+	static private Vibrator vibrator = null; // not what you think
+	static private ToneGenerator dtmf = null;
+	static private AudioManager audioman = null;
+	static private SocketFeet parent;
+	static private ControlWebSocketServer controlWebSocketServer = null;
+
+	//constructor
+	public RobotOperations(SocketFeet p, ControlWebSocketServer cwss)
+	{
+		parent = p;
+		controlWebSocketServer = cwss;
+	};
+
+	//turns on/off gps and sensors. Saves power by doing so.
+	public void activate(boolean gps, boolean hpr, boolean audio, int pulse)
+	{
+
+		activategps(gps);
+		activatehpr(hpr);
+		activateaudio(audio);
+		joypulse = pulse;
+		UpdatePulse(pulse);
+	}
+	public void activatehpr(boolean hpr)
+	{
+		if (hpr)
+		{
+			if (mCompassManager == null)
+				mCompassManager = (SensorManager) parent.getSystemService(Context.SENSOR_SERVICE);
+			mCompassManager.registerListener(this, mCompassManager.getDefaultSensor(Sensor.TYPE_ORIENTATION),SensorManager.SENSOR_DELAY_UI); // in order: _FASTEST, _GAME, _UI, _NORMAL
+			hpron = true;
+		}
+		else if (mCompassManager != null)
+			try {mCompassManager.unregisterListener(this);} catch (Exception e) {} finally{mCompassManager = null;hpron=false;};
+	}
+	public void activategps(boolean gps)
+	{
+		if (gps)
+		{
+			mLocationManager = (LocationManager) parent.getSystemService(Context.LOCATION_SERVICE);
+			mLocationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER,0, 0, this); // this actually turns on the gps
+			gpson=true;
+		}
+		else if (mLocationManager != null)
+			try {mLocationManager.removeUpdates(this);} catch (Exception e) {} finally{gpson=false;};
+	}
+	public void activateaudio(boolean audio)
+	{
+		// raise the roof
+		if (audio)
+		{
+			if (vibrator == null)
+				vibrator = (Vibrator) parent.getSystemService(Context.VIBRATOR_SERVICE);
+			if (audioman == null)
+				audioman = (AudioManager) parent.getSystemService(Context.AUDIO_SERVICE);		
+			audioman.setSpeakerphoneOn(true);
+			if (dtmf == null)
+				dtmf = new ToneGenerator(AudioManager.STREAM_RING, 100);
+			for(int i=0;i<9;i++)
+				try{audioman.setStreamVolume(i, audioman.getStreamMaxVolume(i), 0);} catch(Exception e){};
+				audioon=true;
+		}
+		else if (vibrator != null)
+		{
+			vibrator.cancel();
+			dtmf.release();
+			vibrator = null;
+			dtmf = null;
+			audioman = null;
+			audioon=false;
+		}
+
+
+	}
+
+
+	public final void UpdatePulse(int towhat)
+	{
+		if (curpulse != towhat)
+		{
+			GeneralSerialOut("/"+towhat+"\r");
+			curpulse = towhat;
+		}
+	}
+
+	//asynchronous navigation stuff
+	@Override
+	public final void onSensorChanged(SensorEvent event) {
+		// if (manager.cv.free == false) return;
+		if (event.sensor.getType() == Sensor.TYPE_ORIENTATION) {
+			// average with older headings
+			h = (event.values[0]+headingadjust)%360;//UpdateAngleArrayReturnAverage(Headings, event.values[0]);
+
+			if (autoheading_turn && AudioSerialOutMono.isPlaying() == false) // comes first
+			{
+				tv0 = turnamount(h,wantedheading);
+				tv1 = joypulse_when_auto;
+				if (tv0>60 || tv0 < -60)
+					tv1++;
+				if (tv0>120 || tv0 < -120)
+					tv1++;
+
+				if (tv0 > headingtolerance)
+				{
+					UpdatePulse((int)(tv1));
+					GeneralSerialOut("J6\r");
+					goodheadings = 0;
+				}
+				else if (tv0 < -headingtolerance)
+				{
+					UpdatePulse((int)(tv1));
+					GeneralSerialOut("J4\r");
+					goodheadings = 0;
+				}
+				else
+				{
+					goodheadings++;
+					if (goodheadings > 5)
+					{
+						autoheading_turn = false;
+						UpdatePulse(joypulse);
+						GeneralSerialOut("J5\r");
+					}
+					else
+						if (goodheadings > 2 && autoheading_movement)
+						{
+							UpdatePulse(joypulse);
+							GeneralSerialOut("J8\r");
+							goodheadings=2; // keeps going if we're still stable
+						}
+						else
+							GeneralSerialOut("J5\r");
+				}
+			}
+
+
+
+			p = event.values[1];// UpdateAngleArrayReturnAverage(Pitches,event.values[1]);
+			r = event.values[2];// UpdateAngleArrayReturnAverage(Rolls,event.values[2]);
+
+			tv0 = Math.abs(p);
+			if (tv0 > 45 && tv0 < 135)
+				phoneorientation = 'V';
+			else
+				phoneorientation = 'H';
+
+			if (hprspam)
+				broadcast("$PHPR,"+Printrunc(h,1)+","+Printrunc(p,1)+","+Printrunc(r,1)+"*\t\t");
+		}
+	}
+
+	@Override
+	public final void onLocationChanged(Location location) {
+		navlat = location.getLatitude();
+		navlon = location.getLongitude();
+		navalt = location.getAltitude();
+		navbrg = location.getBearing();
+		navspd = location.getSpeed();
+		navtim = location.getTime();
+		tv0 = location.getAccuracy();
+		validfix = (tv0 > 0.0) && (tv0 < 16.0);
+		if (locspam)
+			broadcast("$PLOC,"+navlat+","+navlon+"*\t\t");
+
+	}
+
+	// we're not using these
+	@Override public final void onStatusChanged(String arg0, int arg1, Bundle arg2) {}
+	@Override public final void onProviderDisabled(String provider) {}
+	@Override public final void onProviderEnabled(String provider) {}
+	@Override public final void onAccuracyChanged(Sensor arg0, int arg1) {}
+
+
+
+	// utility functions last
+	public String ExecuteCommand(String commandString)
+	{
+		// normalize carriage returns
+		commandString = commandString.trim();
+		commandString = commandString.replace("\r", "");
+		commandString = commandString.replace("\n", "");
+		String cmd = commandString.toLowerCase();
+		// execute commands
+		if (cmd == "")
+			return "";
+		else if (cmd.startsWith("j")) // direct joystick command, send right away!
+		{
+			UpdatePulse(joypulse);
+			autoheading_turn=false; // we just got a joystick command, so kill navigation
+			autoheading_movement=false;
+			GeneralSerialOut(commandString+"\r");
+		}
+		else if (cmd.startsWith("s/")) // save joypulse
+		{
+			int playme;
+			try{ playme = Integer.parseInt(cmd.substring(2));
+			joypulse = playme;
+			curpulse = playme;
+			GeneralSerialOut(commandString.substring(1, commandString.length())+"\r");
+			}catch(Exception e){return("Invalid argument");};
+		}
+		else if (cmd.startsWith("s")) // serial command to the microcontroller directly: analyze and pass thru
+			GeneralSerialOut(commandString.substring(1, commandString.length())+"\r");
+		else if (cmd.startsWith("quit"))
+			parent.nuketheapp();
+		else if (cmd.startsWith("hprspam"))
+			hprspam = !hprspam;
+		else if (gpson==true && cmd.startsWith("gpsoff"))
+			activategps(false);
+		else if (gpson==false && cmd.startsWith("gpson"))
+			activategps(true);
+		else if (hpron==true && cmd.startsWith("hproff"))
+			activatehpr(false);
+		else if (hpron==false && cmd.startsWith("hpron"))
+			activatehpr(true);
+		else if (cmd.startsWith("hudon"))
+			setBright(1.0);
+		else if (cmd.startsWith("hudoff"))
+			setBright(0.0);
+		else if (cmd.startsWith("face")) // save joypulse
+		{
+			double playme;
+			try{ playme = Double.parseDouble(cmd.substring(4));
+			toheading(playme,5, false);
+			}catch(Exception e){return("Invalid argument");};
+		}
+		else if (cmd.startsWith("head")) // save joypulse
+		{
+			if (cmd.endsWith("head")) // means keep going
+			{
+				GeneralSerialOut("J8\r");
+				toheading(h,5, true);
+			}
+			else
+			{				
+			double playme;
+			try{ playme = Double.parseDouble(cmd.substring(4));
+			toheading(playme,5, true);
+			}catch(Exception e){return("Invalid argument");};
+			}
+		}
+
+		else if (cmd.startsWith("gps"))
+			broadcast("$PLOC,"+navlat+","+navlon+"*\n");
+		else if (cmd.startsWith("hpr"))
+			broadcast("$PHPR,"+Printrunc(h,1)+","+Printrunc(p,1)+","+Printrunc(r,1)+"*\n");
+		else if (cmd.startsWith("play"))
+		{
+			int playme=-1;
+			try{ playme = Integer.parseInt(cmd.substring(4));}catch(Exception e){};
+			play_tone(playme);
+		}
+		else
+			return("Unknown command "+commandString);
+
+		return("Command "+commandString+" executed");
+	}
+
+
+	public void toheading(double hdg, double tol, boolean move)
+	{
+		wantedheading = hdg;
+		headingtolerance = tol;
+		GeneralSerialOut("/"+joypulse_when_auto+"\r");
+		goodheadings = 0;
+		autoheading_turn = true;
+		autoheading_movement = move;
+	}
+
+
+	public void broadcast(String msg) // direct send: ENDEAVOR NOT TO USE!!!! We're not trying to take over socketfeet here. 
+	{
+		try{controlWebSocketServer.sendToAll(msg);}catch(Exception e){e.printStackTrace();};
+	}
+
+	public void play_tone(int playme)
+	{
+		if (dtmf == null)
+			return;
+		if (vibrator == null)
+			return;
+		if (playme < 0)
+		{dtmf.stopTone();vibrator.cancel();}
+		else if (playme < 29)
+			dtmf.startTone(playme);
+		else
+			vibrator.vibrate(playme);
+	}
+
+	public void setBright(double value) {
+		if (value < (-0.999))
+			value = 0.0;
+		else if (value < (1.0/128.0)) // droid / eris hack to prevent screen timeout
+			value = (1.0/128.0);
+		else if (value > 1.0)
+			value = 1.0;
+		WindowManager.LayoutParams lp = parent.getWindow().getAttributes();
+		lp.screenBrightness = (float)value;
+		parent.getWindow().setAttributes(lp);
+	}
+
+
+	// actually cheaper than flexround and prevents stuff like number.9999998 or the like to show up when it doesn't make sense for them to
+	// OPTIMIZE ME
+
+	static public final String Printrunc(double roundthis, int decimals) {
+		int numdigits = 0;
+		double roundme = 0;
+		String e;
+		if (decimals == 0)
+			return "" + (long) roundthis + "";
+		else
+			numdigits++;
+
+		if (roundthis == 0.0)
+			return "0";
+
+		if (roundthis < 0.0) // room for the -
+		{
+			numdigits++;
+			roundme = -roundthis;
+			e = "-" + roundme + "        ";
+		} else {
+			roundme = roundthis;
+			e = roundme + "        ";
+		}
+
+		// Log.i("RobotClient_Derp","derp"+numdigits+"derp"+decimals+"derp"+(numdigits+decimals));
+		numdigits = numdigits + (int) (Math.log(roundme) * base10) + decimals;
+		e = (e.substring(0, numdigits + decimals)).trim();
+		return e;
+	}
+
+	public void nuketheapp(){setBright(1.0);android.os.Process.killProcess(android.os.Process.myPid());parent.finish();}
+
+
+	public double turnamount(double current, double desired)
+	{
+		tv0 = (1440.0 + current - desired)%360.0;
+		tv1 = (1440.0 - current + desired)%360.0;
+		if (tv0 == tv1)
+			return 180.0;
+		if (tv0 < tv1)
+			return tv1 - 360.0;
+		return 360.0 - tv0;
+	}
+	
+	
+	public void GeneralSerialOut(String cmd)
+	{
+		if (outputH)
+			HardwareSerialOut(cmd);
+		if (outputA)
+			AudioSerialOutMono.output(cmd);
+//		if (outputB)
+//			Bluetooth.output(cmd);
+	}
+	
+	public boolean HardwareSerialOut(String cmd) { // send exact string: cr or crlf are now added inline. Makes sure we know what is being sent.
+		if (cmd != null)
+		{
+			try {
+				// can this be optimized more?
+				if (serialdata_out == null)
+					serialdata_out = new FileWriter("/dev/ttyMSM2");
+				serialdata_out.write(cmd);
+				serialdata_out.flush();
+
+			} catch (Exception e) {
+				Log.e("DERPAGE","HERP A DERP");
+					return false;
+			}
+			return true;
+		}
+		return true;
+	}
+
+	
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/*
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.io.DataInputStream;
+import java.io.FileInputStream;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.net.Socket;
+import java.util.UUID;
+import java.util.LinkedList;
+
+import re.serialout.AudioSerialOutMono;
+
+
+import android.app.Activity;
+import android.app.PendingIntent;
+import android.content.Context;
+import android.content.Intent;
+import android.content.pm.ActivityInfo;
+import android.content.res.Configuration;
+import android.hardware.Sensor;
+import android.hardware.SensorEvent;
+import android.hardware.SensorEventListener;
+import android.hardware.SensorManager;
+import android.location.Location;
+import android.location.LocationListener;
+import android.location.LocationManager;
+import android.media.AudioManager;
+import android.media.ToneGenerator;
+import android.net.Uri;
+import android.net.wifi.WifiManager;
+import android.os.Bundle;
+import android.os.CountDownTimer;
+import android.os.Handler;
+import android.os.Message;
+import android.os.PowerManager;
+import android.os.SystemClock;
+import android.os.Vibrator;
+import android.telephony.SmsManager;
+import android.util.Log;
+import android.view.Menu;
+import android.view.MenuInflater;
+import android.view.MenuItem;
+import android.view.View;
+import android.view.Window;
+import android.view.WindowManager;
+import android.widget.TextView;
+
+public class RobotOperations extends Activity implements SensorEventListener, LocationListener {
+
+	// why all the static public stuff: how many of these things are going to run on a phone anyway?
+
+	static public RobotOperations soliton;
+	static public String serialportname = "/dev/ttyMSM2"; 
+	static public int serialportbaud = 57600; 
+	static public String idString = "0"; // 0 will be a debug ID by default; Robots should be
+	static public String bluetoothMAC = "";
+	static public Socket sc;
+	static public Vibrator vibrator; // not what you think
+	static public ToneGenerator dtmf;
+	static public final int LocalFrameRate = 10;
+	static public final int PriThreadDelay =80;
+	static public final int SecThreadDelay = 1000;
+	static public final int TryConnectDelay = 10;
+	static public boolean PriThreadImage = true; // are we doing images in the first or second thread?
+	static public boolean PriThreadSend = true;
+	static public boolean SendOnCallback = true; // Speeds up lower rezzes quite a bit
+	static public boolean isrunning = false;
+	static public boolean forcenuke = true; // nuke PID at end?
+	static public boolean useaudio = true;
+	static public boolean fullscreen = false;
+	static public boolean useprop = false; // use Picaxe daughterboard (stupid) vs. use Parallax Propeller daughterboard (smart)
+	static public boolean sendhpr = true;
+	static public boolean sendgps = true;
+	static public AudioManager audioman;
+	static public int SerialQueueMaxSize = 5;
+	static public String nmeaout_gps;
+	static public String nmeaout_hpr;
+	static public int headingadjust = 0;
+	static public int RequestEachFrame = 1; // how many frames to actually request when there's a write (smoothness vs. lag)
+	static public LinkedList<String> SerialQueue = new LinkedList<String>();
+
+
+
+	// location stuff
+	static public double navlat, navlon, navalt, navbrg, navhdg, navspd, navtim, navpit,navrol;
+	static public byte[] Command = new byte[128]; // navcom style!
+	static public int CommandPtr = 0; // navcom style!
+	static public int commandin = 0;
+	static public String navstr = "0,0,0,0,0";
+	static public String vecstr = "0";
+	static public boolean shownmea = false; // show nmea on screen or not
+	static public boolean showimage = true; // show nmea on screen or not
+
+
+	// private SensorManager mSensorManager;
+	static public SensorManager mCompassManager;
+	static public LocationManager mLocationManager;
+	static public WifiManager mWifiManager;
+
+	static public boolean DoUpdateText = false;
+	// check activity
+	static public long framenum = 0;
+
+	// overrides both serial and bluetooth right now (todo: output on all these output ports?)
+	static public boolean modemize = false;
+
+	// serial port stuff
+	static public FileInputStream serialport_in;
+	static public FileWriter serialdata_out;
+	static public final int serialkeep = 128;
+
+	// shared between serial and bluetooth	
+	static public DataInputStream serialdata_in;
+	static public boolean serialout_free = false;
+	static public boolean serialin_free = false;
+	static public boolean SerialTrueBTFalse = false;
+
+	// bluetooth
+	static public BluetoothSocket bluetooth_sock;
+	static public BufferedOutputStream bluetooth_out;
+	static public BufferedInputStream bluetooth_in;
+
+	static public boolean initialized = false;
+	static public String serstr = "0,0:0:0,0*";
+	static public char reschar = 'R';
+	static public PowerManager pm;
+	static public PowerManager.WakeLock wl;
+	static public boolean seriallisten = true;
+
+	// automatic restore/hangup stuff
+	static public boolean dialing = false;
+	static public String commandFileName;
+	// configuration stuff
+
+	static public ConnectionManager manager;// Connection stuff
+	static public CustomCameraView cv;
+
+	static public Handler msghandler;
+	static public TextView txtmsg;
+	static public TextView label;
+	static public Bundle tempdata;
+
+	static public char realorientation='V';
+
+	@Override
+	public final void onCreate(Bundle savedInstanceState) {
+		if (isrunning)
+			killme();// only one instance!
+		else
+			soliton = this;
+		isrunning = true;
+		super.onCreate(savedInstanceState);
+		requestWindowFeature(Window.FEATURE_NO_TITLE); // no title should ALWAYS BE ON for this
+		setContentView(R.layout.main);
+		commandFileName = getFilesDir().getAbsolutePath() + "command.txt";
+		pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+		wl = pm.newWakeLock(PowerManager.SCREEN_DIM_WAKE_LOCK
+				| PowerManager.ON_AFTER_RELEASE, "Datalogger"); // PARTIAL_WAKE_LOCK
+
+		soliton.setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE);
+		mWifiManager = (WifiManager) getSystemService(Context.WIFI_SERVICE);
+
+		msghandler = new Handler() {
+			public final void handleMessage(Message msg) {
+				if (msg.what == 1) {
+					// we're done
+					sc = ConnectionManager.sc;// ConnectionManager.getConnection();
+					CustomCameraView.setConnection(sc);
+					if (ConnectionManager.cv == null)
+						ConnectionManager.cv = (CustomCameraView) findViewById(R.id.overview);// new
+					cv = ConnectionManager.cv;
+					ConnectionManager.cv.startPreview();
+					CustomCameraView.setResolution(reschar,true);
+					CustomCameraView.paused = false;
+					CustomCameraView.connected = true;
+					//					manager.stop();
+					View temp = findViewById(R.id.label);
+					temp.setVisibility(View.GONE);
+					temp = findViewById(R.id.progress);
+					temp.setVisibility(View.GONE);
+					temp = findViewById(R.id.icon);
+					temp.setVisibility(View.GONE);
+				}
+				// otherwise display the message
+				else if (msg.what == 2) // reconnect! - If this is 0 EVERY UNSPECIFIED WHAT CALLS THIS!
+				{
+					View temp = findViewById(R.id.label);
+					temp.setVisibility(View.VISIBLE);
+					temp = findViewById(R.id.progress);
+					temp.setVisibility(View.VISIBLE);
+					temp = findViewById(R.id.icon);
+					temp.setVisibility(View.VISIBLE);
+
+					connect();
+
+				} else // it's a 0, and that means it's a text message
+				{
+					tempdata = msg.getData();
+					txtmsg.setText(tempdata.getString("err"));
+					label.setText(tempdata.getString("err"));
+				}
+			}
+		};
+	}
+
+	public final void onStart() {
+		super.onStart();
+		final Window win = getWindow();
+
+		ReadConfig.readfile(); // this COULD be replaced with Android Preferences but a text file has its advantages (readble, portable)
+		idString=ReadConfig.getstring("id","0");
+		fullscreen=ReadConfig.getboolean("fullscreen",false);
+		headingadjust=(int) ReadConfig.getint("compassfix", 0);
+		headingadjust=(int) ReadConfig.getint("headingadjust", headingadjust);
+		serialportbaud=(int) ReadConfig.getint("serialbaud",9600);
+		reschar=ReadConfig.getstring("resolution","r").toUpperCase().charAt(0);
+		serialportname=ReadConfig.getstring("serialport","/dev/ttyMSM2");
+		bluetoothMAC=ReadConfig.getstring("bluetooth","").toUpperCase();
+		modemize=ReadConfig.getboolean("modemize", false); // this will want baudrates etc.
+		if (ReadConfig.getboolean("wifion", false))
+			initwifi(true);
+		if (ReadConfig.getboolean("wifioff", false))
+			initwifi(false);
+
+		txtmsg = (TextView) findViewById(R.id.textbar);
+		label = (TextView) findViewById(R.id.label);
+
+		if (fullscreen)
+			win.setFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN,WindowManager.LayoutParams.FLAG_FULLSCREEN);
+		// CustomCameraView(soliton.getApplicationContext());
+
+		if (modemize)
+		{
+			Log.i("RobotClient_SerialComms","USING AUDIO OUTPUT AS MODEM AT "+serialportbaud+ " BAUDRATE");
+			AudioSerialOutMono.new_baudRate = serialportbaud;
+			AudioSerialOutMono.activate(); 
+			//ModemizerOut.UpdateParameters();
+			SerialTrueBTFalse = true;
+			seriallisten=false;
+			serialin_free=false;
+			serialout_free = true; // not quite true, but otherwise we'd block far too much
+		}
+		else if (bluetoothMAC.matches("\\w\\w:\\w\\w:\\w\\w:\\w\\w:\\w\\w:\\w\\w"))
+		{
+			BluetoothAdapter ada = BluetoothAdapter.getDefaultAdapter();
+			ada.enable();
+			Log.i("RobotClient_SerialComms","USING BLUETOOTH DEVICE "+bluetoothMAC);
+			serialin_free = InitBluetooth();
+			SerialTrueBTFalse = false;
+		}
+		else
+		{
+			Log.i("RobotClient_SerialComms","USING SERIAL PORT "+serialportname+" AT "+serialportbaud+ "BAUDRATE");
+			serialin_free = InitSerialPort();
+			SerialTrueBTFalse = true;
+		}
+		ClientStartupReceiver.dochmod();
+		connect();
+		initsensors();
+
+		seriallisten=ReadConfig.getboolean("sensors",true);
+		if (seriallisten == false)
+			serstr = "0,0****"; // reminder: will get overwritten anyway
+
+
+
+		NAVCOMCLoop(14000);
+	}
+
+
+	static public final void initwifi(boolean derp)
+	{
+		mWifiManager.setWifiEnabled(derp);
+		if (derp)
+		{
+			mWifiManager.startScan();
+			mWifiManager.reconnect();
+		}
+
+	}
+
+	static public long dt_earlier;
+	static public long dt_now;
+	static public long deltatime()
+	{
+		dt_earlier = dt_now;
+		dt_now = System.currentTimeMillis();
+		return dt_now - dt_earlier;
+	}
+
+	static public final void connect() {
+		// wait here for connection?
+		manager = new ConnectionManager(msghandler);
+		ConnectionManager.cv = (CustomCameraView) soliton.findViewById(R.id.overview);// new
+		CustomCameraView.paused = false;
+		ConnectionManager.cv.startPreview();
+		ConnectionManager.setIP(ReadConfig.getstring("serverip", "127.0.0.1"));
+		ConnectionManager.setIP2(ReadConfig.getstring("serverip2", "127.0.0.1"));
+		ConnectionManager.setID(idString);
+		manager.start();
+		dialing = false;
+	}
+
+
+
+	static public final void initsensors() {
+
+		mCompassManager = (SensorManager) soliton.getSystemService(Context.SENSOR_SERVICE);
+		mCompassManager.registerListener(soliton, mCompassManager.getDefaultSensor(Sensor.TYPE_ORIENTATION),SensorManager.SENSOR_DELAY_UI); // in order: _FASTEST, _GAME, _UI, _NORMAL
+
+		// raise the roof
+		if (useaudio)
+		{
+			vibrator = (Vibrator) soliton.getSystemService(VIBRATOR_SERVICE);
+			audioman = (AudioManager) soliton.getSystemService(Context.AUDIO_SERVICE);		
+			audioman.setSpeakerphoneOn(true);
+			dtmf = new ToneGenerator(AudioManager.STREAM_RING, 100);
+			for(int i=0;i<9;i++)
+				try{audioman.setStreamVolume(i, audioman.getStreamMaxVolume(i), 0);} catch(Exception e){};
+		}
+
+		mLocationManager = (LocationManager) soliton.getSystemService(Context.LOCATION_SERVICE);
+		mLocationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER,0, 0, soliton); // this actually turns on the gps
+
+		showimage = ReadConfig.getboolean("showimage", true);
+		shownmea = ReadConfig.getboolean("shownmea", false);
+		double brightness = ReadConfig.getreal("brightness",1.0);
+		setBright(brightness);
+		if (brightness < 0.01)// not a whole lot of point in displaying if we can't see them!
+		{
+			shownmea=false;
+			showimage=false;
+		}
+
+	}
+
+	public final void onPause() {
+		super.onPause();
+		setBright(1.0);
+		CustomCameraView.paused = true;
+	}
+
+
+	// how the fuck often is onResume being called?
+	public final void onResume() {
+		super.onResume();	
+		if(CustomCameraView.connected)
+			ConnectionManager.cv.startPreview();
+		CustomCameraView.paused = false;
+	}
+
+	public final void onStop() {
+		super.onStop();
+		setBright(1.0);
+		CustomCameraView.paused = true;
+		if (dialing) {
+			writeCommand("input keyevent 4\n");
+		}
+	}
+
+	public final void onConfigurationChanged(Configuration newConfig) {
+		super.onConfigurationChanged(newConfig);
+		soliton.setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE); // in landscape view, we display raw image data unless specified by user
+	}
+
+	public final void onDestroy() {
+		//restartme();
+		setBright(1.0);
+		try{CustomCameraView.gtfo();}catch(Exception e){}; // this may prevent some craziness in case of crash
+		try{ConnectionManager.suicide();}catch(Exception e){}; // this may prevent some craziness in case of crash
+		super.onDestroy();
+		killme();
+	}
+
+
+	static public final void com_in()
+	{
+		if (serialin_free == false || seriallisten == false)
+			return;
+		if (SerialTrueBTFalse)
+		{
+			// Poll serial port to see if the daughterboard had anything to say
+			serialin_free = false;
+			try {
+				int ava = (int) (serialdata_in.available() - serialkeep);
+
+				if (ava > 2) {
+					String serstr1 = "";
+					String serstr2 = "";
+					boolean doserial = true;
+
+					while (ava > 8)
+					{
+						ava = ava - 8;
+						serialdata_in.readLong();
+					}
+					while (ava > 0)
+					{
+						ava--;
+						serialdata_in.read();
+					}
+
+					while (doserial){ // why are we doing two lines: to make sure we actually get one full one since readline won't tell us
+						serstr1 = serialdata_in.readLine(); 
+						serstr2 = serialdata_in.readLine();
+
+						if (serstr2.length() > serstr1.length())
+							serstr = new String(serstr2);
+						else if (serstr1.length() > 1)
+							serstr = new String(serstr1);
+						else
+							serstr = "-1,-1*";
+
+
+						serstr2 = null;
+						serstr1 = null;
+
+						if (serstr != null)
+						{
+							//Log.i("RobotClient_DEBUG",serstr);
+							if (serstr.endsWith("*"))
+							{
+								// recover recoverable errors
+								char startchar = serstr.charAt(0);
+								if (startchar == '$')
+								{
+									startchar = serstr.charAt(1);
+									if (startchar == 'N')
+										serstr = "$"+serstr;
+
+									doserial = false;
+								} else if (startchar == 'P')
+								{
+									serstr = "$"+serstr;
+									doserial = false;
+								} else if (startchar == 'N'|| startchar == 'D')
+								{
+									serstr = "$P"+serstr;
+									doserial = false;
+								}
+								else
+								{
+									serstr = "-5,-5";
+									seriallisten = false;
+									serstr = "0,0****"; // reminder: will get overwritten anyway
+									serialin_free = true;
+									return;
+								}
+
+
+								// parse and do some sanitizing while we're at it
+								startchar = serstr.charAt(2);
+								useprop = (startchar == 'N');
+								if (startchar == 'D' || useprop) { 
+									serstr = serstr.substring(4);
+									if (serstr.startsWith("254")) {
+										SerialSend(".11"+cr); // gotta send a packet to the micro lest it sit there stupidly
+										Log.i("RobotClient_RobotClient", "Handshake received and acknowledged");
+										//seriallisten = false;
+									}
+									char[] derpity = serstr.toCharArray();
+									short derp = 0;
+									for (int i=0;i<derpity.length;i++)
+									{
+										derp = (short)serstr.charAt(i);
+										if ((derp < 42) || (derp > 58)) // allows , * and 0-9, and :
+										{
+											serstr = "-4,-4*";
+											i = derpity.length+1;
+											seriallisten = false;
+											serstr = "0,0****"; // reminder: will get overwritten anyway
+										}
+									}
+								} else {serstr = "-1,-1*";}
+							} else {serstr = "-2,-2*";}
+						} else {serstr = "-3,-3*";}
+					}
+				}
+			} catch (IOException e) {
+				Log.e("CameraError", "Serial port input error: "
+						+ e.getMessage());
+			}
+		} else {
+			// Poll bluetooth port to see if the daughterboard had anything to say
+			serialin_free = false;
+
+			try {
+
+
+				byte[] buffer = new byte[1];
+				int bytes = 0;
+				if (serialdata_in.available() > 0)
+				{
+					bytes = serialdata_in.read(buffer);
+					//Log.d("ZeeTest", "++++ Read "+ bytes +" bytes "+(char)buffer[0]);
+				}
+
+				int ava = (int) (serialdata_in.available());// - serialkeep);
+
+				if (ava > 2) {
+					String serstr1 = "";
+					String serstr2 = "";
+					boolean doserial = true;
+
+					while (ava > 8)
+					{
+						ava = ava - 8;
+						serialdata_in.readLong();
+					}
+					while (ava > 0)
+					{
+						ava--;
+						serialdata_in.read();
+					}
+
+					while (doserial){ // why are we doing two lines: to make sure we actually get one full one since readline won't tell us
+						serstr1 = serialdata_in.readLine(); 
+						serstr2 = serialdata_in.readLine();
+
+						if (serstr2.length() > serstr1.length())
+							serstr = new String(serstr2);
+						else if (serstr1.length() > 1)
+							serstr = new String(serstr1);
+						else
+							serstr = "-1,-1*";
+
+
+						serstr2 = null;
+						serstr1 = null;
+
+						if (serstr != null)
+						{
+							//Log.i("RobotClient_DEBUG",serstr);
+							if (serstr.endsWith("*"))
+							{
+								// recover recoverable errors
+								char startchar = serstr.charAt(0);
+								if (startchar == '$')
+								{
+									doserial = false;
+								} else if (startchar == 'P')
+								{
+									serstr = "$"+serstr;
+									doserial = false;
+								} else if (startchar == 'N'|| startchar == 'D')
+								{
+									serstr = "$P"+serstr;
+									doserial = false;
+								}
+								else
+								{
+									serstr = "-5,-5";
+									serialin_free = true;
+									return;
+								}
+
+
+								// parse and do some sanitizing while we're at it
+								startchar = serstr.charAt(2);
+								useprop = (startchar == 'N');
+								if (startchar == 'D' || useprop) { 
+									serstr = serstr.substring(4);
+									if (serstr.startsWith("254")) {
+										SerialSend(".11"+cr); // gotta send a packet to the micro lest it sit there stupidly
+										Log.i("RobotClient_RobotClient", "Handshake received and acknowledged");
+									}
+									char[] derpity = serstr.toCharArray();
+									short derp = 0;
+									for (int i=0;i<derpity.length;i++)
+									{
+										derp = (short)serstr.charAt(i);
+										if ((derp < 42) || (derp > 58)) // allows , * and 0-9, and :
+										{
+											serstr = "-4,-4*";
+											i = derpity.length+1;
+										}
+									}
+								} else {serstr = "-1,-1*";}
+							} else {serstr = "-2,-2*";}
+						} else {serstr = "-3,-3*";}
+					}
+				}
+			} catch (IOException e) {
+				Log.e("CameraError", "Serial port input error: "
+						+ e.getMessage());
+			}
+
+		}
+		serialin_free = true;
+	}
+
+	String serialsalvage="";
+	int derp = 0;
+	static public final void com_out()
+	{
+		// send serial port data out (commands and gps). Only one command per frame to avoid flooding the buffer in the microcontroller
+		if (serialout_free && (SerialQueue.size()>0))
+		{
+			serialout_free = false;
+			if (modemize)
+				GeneralSerialOut(SerialQueue.poll());
+			else if (SerialTrueBTFalse)
+				SerialOutput(SerialQueue.poll());
+			else
+				BluetoothOutput(SerialQueue.poll());
+			serialout_free = true;
+		}
+	}
+
+
+	static public final void ExecuteQueuedComand()
+	{
+		if (SmsIntentReceiver.CommandQueue.size() > 0)
+			ExecuteCommand(SmsIntentReceiver.CommandQueue.poll());
+	}
+
+	static public final void checkforcommand()
+	{
+		// Now see if there's any commands coming from the network connection.
+		commandin = 0;
+		try {
+			if (CustomCameraView.connected == true) {
+				commandin = CustomCameraView.in.available();
+			}
+		} catch (Exception err) {
+			commandin = 0;
+			Log.e("CameraError", "Command input error:" + err.getMessage());
+		}
+
+		if (commandin > 0) {
+			ConnectionManager.MissedNetworkFrames = 0;
+			CustomCameraView.alreadyasked = false;
+			CustomCameraView.requested=RequestEachFrame; // send this many frames even without feedback (smoother)
+			while (commandin-- > 0) {
+				try {
+					Command[CommandPtr] = (byte) CustomCameraView.in.read();
+				} catch (Exception err) {
+					Command[CommandPtr] = (byte) 0;
+					Log.e("CameraError", "Command read error:" + err.getMessage());
+				}
+				if ((Command[CommandPtr] == 13) || (Command[CommandPtr] == 10) || (CommandPtr > 120)) {
+					String e = new String(Command).substring(1, CommandPtr);
+					if (Command[0] == 64) // @ sign
+						SmsIntentReceiver.CommandQueue.add(e);
+					else
+						Log.i("RobotClient_RobotClient", "Invalid command " + e);
+					commandin = -1; // get out of this loop and process eventual next command during next iteration
+					CommandPtr = 0;
+					for (int i = 0; i < 128; i++)
+						Command[i] = 0;
+				}
+				if (Command[CommandPtr] > 0)
+					CommandPtr++;
+			}
+		}
+
+	}
+
+	static public char cmdname;
+	static public boolean valid;
+	static public final boolean SerialSendEnqueueFirst(String cmd)
+	{
+		if (sendhpr == false)
+			SerialEnqueue(nmeaout_hpr);
+		if (sendgps == false)
+			SerialEnqueue(nmeaout_gps);
+		sendhpr = true; sendgps = true; // generally safe to assume we need to send nav data
+		return SerialSend(cmd);
+	}
+
+	static public final void ExecuteCommand(String cmd) {
+		valid = false;
+		cmdname = cmd.toUpperCase().charAt(0); // command token (first letter)
+		if (false) {
+		} else if (cmd.compareTo("SENSORS") == 0) {
+			valid = true;
+			cmd = "";
+			if (seriallisten)
+			{
+				seriallisten = false;
+				serstr = "0,0****"; // reminder: will get overwritten anyway
+				return;
+			}
+			else
+			{
+				seriallisten = true;
+				com_in();
+				com_in();
+				return;
+			}
+
+			// these could probably go in a macro file, maybe in config
+		}
+		else if (cmdname == 'S') // serial command to the propeller chip (terminate with cr or lf)
+		{
+			if (sendhpr == false)
+				SerialEnqueue(nmeaout_hpr);
+			if (sendgps == false)
+				SerialEnqueue(nmeaout_gps);
+			sendhpr = true; sendgps = true; // generally safe to assume we need to send nav data
+			valid = SerialSend(cmd.substring(1) + cr);
+		}
+		else if (cmdname == 'J') {// joystick command (don't terminate)
+			if (useprop)
+			{
+				sendhpr = false; sendgps = false; // we're joystick-ing, so we don't need nav data
+				valid = SerialSend("j"+cmd.charAt(1)+cr); // prevents occasional lock loss
+			}
+			else if (modemize)
+				valid = SerialSend("j"+cmd.charAt(1)+cr); // prevents occasional lock loss
+			else
+				valid = SerialSend(cmd.substring(1, 2));
+		}else if (cmdname == 'C') {
+			// make a telephone call using the number provided; the entire pile
+			// of digits here is a command
+			cmd = cmd.substring(1);
+			cmd = cmd.trim();
+			if (cmd.matches("\\d+"))
+			{
+				valid = true;
+				makeCall(cmd);
+			}
+		}else if (cmdname == 'M') {
+			// make a telephone call using the number provided; the entire pile
+			// of digits here is a command
+			cmd = cmd.substring(1);
+			cmd = cmd.trim();
+			if (cmd.matches("\\d+") || cmd.contains("@"))
+			{
+				valid = true;
+				MakeSMS(cmd,SmsIntentReceiver.telestring); // send telemetry string to number
+			}
+			if (cmd.length() < 1 && SmsIntentReceiver.respondtowho.length() > 0)
+			{
+				valid = true;
+				MakeSMS(SmsIntentReceiver.respondtowho,SmsIntentReceiver.telestring); // send telemetry string to last number
+			}
+
+		} else if (cmd.compareTo("HANG") == 0) {
+			valid = true;
+			writeCommand("input keyevent 6\n");
+		} else if ((cmd.compareTo("DC") == 0) || (cmd.compareTo("DISCONNECT") == 0)) // disconnect
+		{
+			valid = true;
+			killme();
+
+		} else if (useaudio == true && cmd.compareTo("ALARM") == 0) // disconnect and try other server if present
+		{
+			valid = true;
+			dtmf.startTone(21);
+		} else if (cmd.compareTo("FLIP") == 0) // disconnect and try other server if present
+		{
+			valid = true;
+			CustomCameraView.connected = false;
+			ConnectionManager.FlipServers();
+			ConnectionManager.MissedNetworkFrames = ConnectionManager.CommandMissedFrameTre*2; // cause disconnect
+		} else if ((cmd.compareTo("RESET") == 0)) // disconnect and reconnect
+		{
+			valid = true;
+			restartme();
+		} else if (cmdname == 'R') {
+			// set the resolution
+			valid = true;
+			CustomCameraView.setResolution(cmd.charAt(1),true);
+			if (cmd.length() > 2)
+				switch (cmd.charAt(2)) {
+				case '1': RequestEachFrame = 1; break;
+				case '2': RequestEachFrame = 3; break;
+				case '3': RequestEachFrame = 5; break;
+				case '4': RequestEachFrame = 7; break;
+				case '5': RequestEachFrame = 9; break;
+				case '6': RequestEachFrame = 11; break;
+				case '7': RequestEachFrame = 13; break;
+				case '8': RequestEachFrame = 15; break;
+				case '9': RequestEachFrame = 17; break;
+				case '0': RequestEachFrame = 9001; break; // just spam em
+				default: serstr = "0,0"; break; // for debugging
+				}
+			// also do frame decimation in here, for slow connections.
+		} else if (cmdname == 'D') {
+			// this is actuallly easier than convincing java to do a bitwise compare on an integer, and that's sad.
+			valid = true;
+			switch (cmd.charAt(1)) {
+			case '0': sendhpr = false; sendgps = false; break;
+			case '1': sendhpr = true; sendgps = false; break;
+			case '2': sendhpr = false; sendgps = true; break;
+			case '3': sendhpr = true; sendgps = true; break;
+			default: serstr = "0,0"; break; // for debugging
+			}
+		} else if (useaudio == true && cmdname == 'P') {
+			// this is actuallly easier than convincing java to do a bitwise compare on an integer, and that's sad.
+
+			try{
+				int playme = Integer.parseInt(cmd.substring(1));
+				valid = true;
+				if (playme < 29)
+					dtmf.startTone(playme);
+				else
+					vibrator.vibrate(playme);
+			} catch(Exception e){
+				dtmf.stopTone();
+				vibrator.cancel();}
+
+			;}
+
+
+		if (valid)
+			Log.i("RobotClient_RobotClient", "GotCommand: " + cmd);
+		else
+			Log.i("RobotClient_RobotClient", "GotInvalidCommand :" + cmd);
+	}
+
+
+	static public boolean MakeSMS(String addr, String sendData)
+	{
+		try{
+			SmsManager mng = SmsManager.getDefault();
+			PendingIntent dummyEvent = PendingIntent.getBroadcast(soliton.getBaseContext(), 0, new Intent("derp.derp.derp.ignore.me"), 0);
+			mng.sendTextMessage(addr, null, sendData, dummyEvent, dummyEvent);
+			Log.i("RobotClient_SmsSend","Msg sent to " + addr + " : " + sendData );
+		}catch(Exception e){
+			Log.e("SmsSend","SendException", e );
+			return false;
+		}
+		return true;
+	}
+
+
+
+	static public final void writeCommand(String commandToWrite) {
+		try {
+			FileWriter meowwriter = new FileWriter(commandFileName, false);
+			meowwriter.write(commandToWrite);
+			meowwriter.close();
+		} catch (IOException e) {
+			Log.e("CreationError", "Error creating file");
+		}
+	}
+
+
+
+
+
+
+	static public final void NAVCOMCLoop(final long setevery) {
+		new CountDownTimer(setevery, PriThreadDelay) {
+			public final void onTick(long millisUntilFinished) {
+					//System.gc();
+					RobotOperations.com_in();
+					RobotOperations.com_out();
+					RobotOperations.checkforcommand();
+					RobotOperations.ExecuteQueuedComand();
+					if (RobotOperations.PriThreadImage)
+					{//manager != null && ConnectionManager.cv != null && 
+							ConnectionManager.cv.newcallback();
+					}
+			}
+			public final void onFinish() {
+				if (wl.isHeld())
+					wl.release();
+				wl.acquire();
+				NAVCOMCLoop(setevery);
+			}
+		}.start();
+	}
+
+	static public final void makeCall(String phoneNumber) {
+		CustomCameraView.paused = true;
+		dialing = true;
+		Uri uri = Uri.fromParts("tel", phoneNumber, null);
+		Intent callIntent = new Intent(Intent.ACTION_CALL, uri);		
+		if (useaudio)
+		{
+			audioman.setSpeakerphoneOn(true);
+			int maxVolume = audioman.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+			audioman.setStreamVolume(AudioManager.STREAM_VOICE_CALL, maxVolume, 0);
+		}
+		callIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+		soliton.startActivity(callIntent);
+	}
+
+
+	public final boolean onCreateOptionsMenu(Menu menu) {
+		MenuInflater inflater = getMenuInflater();
+		inflater.inflate(R.menu.options_menu, menu);
+		return true;
+	}
+
+	public final boolean onPrepareOptionMenu(Menu menu) {
+		return true;
+	}
+
+
+	public final boolean onOptionsItemSelected(MenuItem item) {
+		switch (item.getItemId()) {
+		case R.id.Exit:
+			killme();
+			break;
+		}
+		return true;
+	}
+
+
+	static public final void killme() {
+		isrunning = false;
+		System.gc();
+		try {
+			if (serialdata_in != null) {
+				serialdata_in.close();
+			}
+			if (bluetooth_sock != null) {
+				bluetooth_sock.close();
+			}
+		} catch (IOException e) {
+			e.printStackTrace();
+		}
+		if (SerialTrueBTFalse == false)
+			try{BluetoothAdapter.getDefaultAdapter().disable();}catch(Exception e){Log.e("RobotOperations","Cannot disable bluetooth");};
+			String[] cmd2 = new String[] { "am", "start", "-a",
+					"android.intent.action.MAIN", "-n",
+			"re.anywhere.client/re.anywhere.client.SmsIntentReceiver" };
+			try {Runtime.getRuntime().exec(cmd2);} catch (Exception e1) {}
+			//		SerialSend("\\"+cr);
+			if (wl.isHeld())
+				wl.release(); // turn off wakelock
+			CustomCameraView.free = false;
+			try {ConnectionManager.cv.setEnabled(false);} catch (Exception e) {};
+			try {ConnectionManager.cv.destroyDrawingCache();} catch (Exception e) {};
+			try {CustomCameraView.gtfo();} catch (Exception e) {};
+			try {ConnectionManager.suicide();} catch (Exception e) {};
+			serialout_free = false;
+			serialin_free = false;
+			try {mCompassManager.unregisterListener(soliton);} catch (Exception e) {};
+			try {mLocationManager.removeUpdates(soliton);} catch (Exception e) {};
+			System.gc();
+			if (SerialTrueBTFalse == false)
+			{
+				BluetoothAdapter.getDefaultAdapter().enable();
+			}
+			if (forcenuke)
+			{
+				Log.e("NUKE","Nuke requested for pid "+android.os.Process.myPid());
+				android.os.Process.killProcess(android.os.Process.myPid());
+			}
+			else
+				try {soliton.finish();} catch(Exception e){Log.e("NUKE",e.getMessage());android.os.Process.killProcess(android.os.Process.myPid());} // NUKE
+
+	}
+
+
+	static public final void restartme() {
+		String[] cmd2 = new String[] { "am", "start", "-a",
+				"android.intent.action.MAIN", "-n",
+		"re.anywhere.client/re.anywhere.client.RobotOperations" };
+		try {Runtime.getRuntime().exec(cmd2);} catch (Exception e1) {}
+		killme();
+	}
+
+
+	@Override
+	public final void onAccuracyChanged(Sensor sensor, int accuracy) {
+
+	}
+	String serialstr = "";
+
+
+
+
+
+
+
+	@Override
+	public final void onSensorChanged(SensorEvent event) {
+
+
+		// if (manager.cv.free == false) return;
+		if (event.sensor.getType() == Sensor.TYPE_ORIENTATION) {
+			// average with older headings
+			navhdg = (event.values[0]+headingadjust)%360;//UpdateAngleArrayReturnAverage(Headings, event.values[0]);
+			navpit = event.values[1];// UpdateAngleArrayReturnAverage(Pitches,event.values[1]);
+			navrol = event.values[2];// UpdateAngleArrayReturnAverage(Rolls,event.values[2]);
+			if (useprop)
+				if (sendhpr)
+				{
+					nmeaout_hpr = "$PHPR," + (int)(navhdg) + "," + (int)(navpit) + "," + (int)(navrol)+ "*" + cr;
+					if (SerialEnqueue(nmeaout_hpr)) // OK to skip it if queue is full
+						com_out(); // keep sending them out
+				}
+			vecstr = Printrunc(navhdg, 2);
+			double ori = Math.abs(navpit);
+			if (ori > 45 && ori < 135)
+				realorientation = 'V';
+			else
+				realorientation = 'H';
+		}
+	}
+
+
+	static public final boolean SerialEnqueueAlways(String cmd) {
+		SerialQueue.addLast(cmd);
+		return true;
+	}
+
+
+	static public final boolean SerialSend(String cmd) {
+		if (modemize)
+		{
+			AudioSerialOutMono.output(cmd);
+			return true;
+		}
+		if (serialout_free)
+		{
+			serialout_free = false;
+			if (SerialTrueBTFalse)
+				SerialOutput(cmd);
+			else
+				BluetoothOutput(cmd);
+			serialout_free = true;
+			return true;
+		}
+		else
+		{
+			SerialQueue.addFirst(cmd);
+			return false;
+		}
+	}
+
+
+	static public final boolean SerialEnqueue(String cmd) {
+		if (SerialQueue.size() <= SerialQueueMaxSize)
+		{
+			SerialQueue.addLast(cmd);
+			return true;
+		}
+		Log.i("RobotClient_SERIAL","Packet lost due to queue too long:"+cmd);
+		return false;
+	}
+
+	static public final boolean BluetoothOutput(String cmd)
+	{
+		try {
+			// can this be optimized more?
+			if (bluetooth_out == null)
+				bluetooth_out = new BufferedOutputStream(bluetooth_sock.getOutputStream());
+			bluetooth_out.write(cmd.getBytes());
+			bluetooth_out.flush();
+		} catch (IOException e) {
+			Log.i("RobotClient_CameraSerial", "Cannot send command to bluetooth, trying to fix");
+			return false;
+		}
+		return true;
+	}
+	static public final boolean SerialOutput(String cmd) { // send exact string: cr or crlf are now added inline. Makes sure we know what is being sent.
+		if (cmd != null)
+		{
+			try {
+				// can this be optimized more?
+				if (serialdata_out == null)
+					serialdata_out = new FileWriter(serialportname);
+				serialdata_out.write(cmd);
+				serialdata_out.flush();
+				//			serialdata_out.close();
+				//			serialdata_out = null;
+
+			} catch (IOException e) {
+				Log.i("RobotClient_CameraSerial", "Cannot send command to port, trying to fix");
+				try {
+					Runtime.getRuntime().exec(
+							new String[] { "su", "-c", "chmod 666 "+serialportname });
+					return false;
+				} catch (IOException e1) {
+					Log.i("RobotClient_CameraSerial", "Cannot send command to port at all.");
+					return false;
+				}
+			}
+			return true;
+		}
+		return true;
+	}
+
+
+	public final boolean InitBluetooth() {
+		try
+		{
+			BluetoothDevice zee = BluetoothAdapter.getDefaultAdapter().getRemoteDevice(bluetoothMAC);
+			//    Method m = zee.getClass().getMethod("createRfcommSocket",new Class[] { int.class });bluetooth_sock = (BluetoothSocket)m.invoke(zee, Integer.valueOf(1));
+			bluetooth_sock = zee.createRfcommSocketToServiceRecord(UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")); // magic number for serial port
+			Log.d("BluetoothSerial", "++++ Connecting");
+			bluetooth_sock.connect();
+			Log.d("BluetoothSerial", "++++ Connected");
+			bluetooth_in = new BufferedInputStream(bluetooth_sock.getInputStream(),serialkeep*2);
+			serialdata_in = new DataInputStream(bluetooth_in);
+			bluetooth_out = new BufferedOutputStream(bluetooth_sock.getOutputStream());
+			//out = new BufferedOutputStream(sock.getOutputStream());
+			Log.d("BluetoothSerial", "Bluetooth serial port ready!");
+			serialin_free = true;
+			serialout_free = true;
+			return true;
+		}
+		catch (Exception e)
+		{
+			e.printStackTrace();
+			return false;
+		}
+
+	}
+
+
+	public final boolean InitSerialPort() {
+
+		ClientStartupReceiver.dochmod();
+		try {
+			Runtime.getRuntime()
+			.exec("busybox stty -F "+serialportname+" "+serialportbaud+" -echo");
+		} catch (Exception e) {
+			Log.i("RobotClient_CameraSerial", "Cannot run stty (attempt 1)");
+		}
+		; // makes sure we don't get feedback into the picaxe and that the baud
+		// is right
+		try {
+			Runtime.getRuntime()
+			.exec("toolbox stty -F "+serialportname+" "+serialportbaud+" -echo");
+		} catch (Exception e) {
+			Log.i("RobotClient_CameraSerial", "Cannot run stty (attempt 2)");
+		}
+		; // makes sure we don't get feedback into the picaxe and that the baud
+		// is right
+		try {
+			Runtime.getRuntime().exec("stty -F "+serialportname+" "+serialportbaud+" -echo");
+		} catch (Exception e) {
+			Log.i("RobotClient_CameraSerial", "Cannot run stty (attempt 3)");
+		}
+		; // makes sure we don't get feedback into the picaxe and that the baud
+		// is right
+		try {
+
+			serialport_in = new FileInputStream(serialportname);
+			serialdata_in = new DataInputStream(serialport_in);
+			serialdata_out = new FileWriter(serialportname);
+
+			SerialSend(".11" + cr); // gotta send a packet to the picaxe lest it sit there stupidly
+			Log.i("RobotClient_CameraSerial", "Serial port ready!"); // done!
+			serialin_free = true;
+			serialout_free = true;
+			return true;
+
+		} catch (Exception e) {
+			// txtNMEA.setText("Cannot access serial port; trying to fix (may need root access)");
+			// try {r.exec(cmd1);} catch (Exception e1) {NMEAthere = false;
+			// DebugMsg("Cannot access NMEA serial port (do you have root?)");}
+			Log.e("CameraSerial", "Cannot open serial port! Trying to fix.");
+			ClientStartupReceiver.dochmod();
+			//			killme();
+			return false;
+		}
+	}
+
+
+	@Override
+	public final void onLocationChanged(Location location) {
+		//		if (manager.cv.free == false)
+		//			return;
+		navlat = location.getLatitude();
+		navlon = location.getLongitude();
+		navalt = location.getAltitude();
+		navbrg = location.getBearing();
+		navspd = location.getSpeed();
+		navtim = location.getTime();
+		double derp = location.getAccuracy();
+		boolean validfix = (derp > 0.0) && (derp < 16.0);
+		if (useprop)
+			if (sendgps)
+			{
+				if (validfix) // transmit in 1/10000 of an arcminute: more than enough precision, this isn't a survey grade gps
+					nmeaout_gps = "$PPOS," + (int)(navlat*600000) + "," + (int)(navlon*600000) + "," + (int)(navbrg)+ "*" + cr;
+				else
+				{
+					nmeaout_gps = "$PPOS,0,0,999*"+cr;
+				}
+				SerialEnqueueAlways(nmeaout_gps);
+			}
+		com_out();
+		if (validfix)
+			navstr = Printrunc(navlat, 6) + "," + Printrunc(navlon, 6) + ","+ Printrunc(navalt, 1) + "," + Printrunc(navbrg, 2) + ","+ Printrunc(navspd, 3);
+		else
+			navstr = Printrunc(navlat, 6) + "," + Printrunc(navlon, 6)+ ",0,999,"+Printrunc(location.getAccuracy(),5);
+
+	}
+
+	@Override
+	public final void onProviderDisabled(String provider) {
+	}
+
+	@Override
+	public final void onProviderEnabled(String provider) {
+	}
+
+	@Override
+	public final void onStatusChanged(String provider, int status, Bundle extras) {
+	}
+
+	// use this to update the string at every position/heading fix.
+
+	static public final void UpdateNavText() {
+		// fortunately java does Short-circuit AND Operator
+
+		try
+		{
+			CustomCameraView.text = "$PD," + CustomCameraView.getImageParams()+":"+realorientation+ "," + CustomCameraView.id + "," + navstr + "," + vecstr + "," + serstr + "*";
+			SmsIntentReceiver.telestring = CustomCameraView.text;
+			if (shownmea)
+				txtmsg.setText(CustomCameraView.text);
+		}catch(Exception e){};
+	}
+
+	// generic rounding function, not very fast. OPTIMIZE ME
+
+	static public final double FlexRound(double roundme, double bywhat) {
+		double derp = 1.0 / bywhat;
+		return ((double) ((float) ((long) ((roundme + (0.5 * derp)) * bywhat))) * derp);
+	}
+
+
+	// OPTIMIZE ME
+	// This will work if you have angles in degrees. Note the lack of an unholy
+	// amount of trig to do it! It averages an array of angles and while we're
+	// at it, updates it.
+
+	static public final float UpdateAngleArrayReturnAverage(float[] updateme, float newvalue) {
+		// get data in
+		for (int i = (updateme.length - 1); i > 0; i--)
+			updateme[i] = updateme[i - 1];
+		updateme[0] = newvalue;
+
+		// normalize for discontinuity when going from 359.9 to 0.0
+		for (int i = 1; i < updateme.length; i++)
+			if ((updateme[0] - updateme[i] > 180)
+					|| (updateme[0] - updateme[i] < -180))
+				updateme[i] = 360 - updateme[i];
+
+		// average
+		float result = 0;
+		for (int i = 0; i < updateme.length; i++)
+			result = result + updateme[i];
+		result = result / (updateme.length);
+
+		return result;
+	}
+
+	public static void setBright(double value) {
+		if (value < (-0.999))
+			value = 0.0;
+		else if (value < (1.0/128.0))
+			value = (1.0/128.0);
+		else if (value > 1.0)
+			value = 1.0;
+		WindowManager.LayoutParams lp = soliton.getWindow().getAttributes();
+		lp.screenBrightness = (float)value;
+		soliton.getWindow().setAttributes(lp);
+	}
+}
+
+
+ */

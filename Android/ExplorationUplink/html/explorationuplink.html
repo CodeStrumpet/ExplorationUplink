@@ -1,0 +1,849 @@
+
+   <!DOCTYPE html>
+   <html>
+   <head>
+      <title>Exploration Uplink</title>
+      <meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+      <link type="text/css" rel="stylesheet" href="css/layout.css">
+      <link type="text/css" rel="stylesheet" href="css/uplink_style.css">
+
+      <script type="text/javascript" src="prototype.js"></script>
+      <script type="text/javascript" src="canvas_helper.js"></script>
+
+      <script type="text/javascript">
+
+      LOG_COMMANDS_ENABLED = true;
+      LOG_COMMAND_IDS_ENABLED = true;
+      FLIP_DRIVE_AXIS = false;
+      FLIP_CAMERA_AXIS = false;
+   
+      NOT_CONNECTED = 1;
+      CONNECTING = 2;
+      CONNECTED = 3;
+      
+      CAMERA_MOVEMENT_AMOUNT = 3;
+   
+       var INSTRUCTION_KEY = "INSTRUCTION_KEY";
+    	 var SUBSCRIPTION_KEY = "SUBSCRIPTION_KEY";
+    	 var CONTROL_ATTRIBUTE_KEY = "CONTROL_ATTRIBUTE_KEY";
+    	 var CONTROL_VALUE_KEY = "CONTROL_VALUE_KEY";
+    	 var SUBSCRIPTION_VALUE_CONTROL = 0x1;
+    	 
+    	 // these should be pulled from the config file
+     	var IMAGE_RESOLUTION_KEY = "camera_resolution";
+     	var DIRECTION_CONTROL_KEY = "direction_control";
+     	var CAMERA_CONTROL_KEY = "camera_control";
+     	var MISC_INSTRUCTION_KEY = "misc_instruction";
+     	var PAN_CONTROL_KEY = "tilt_control"; // !!! reversed these 
+      var TILT_CONTROL_KEY = "pan_control"; // !!! reversed these
+ 	 
+    	 // Current controlObjectIDs and their value ranges (in the future this will be pulled from the robot):
+       var controlConfig = {"uv_light" : {"name" : "UV Light", "control_group" : "Lights", "value_type" : "switch", "default" : 0, "return_data" : "none" },
+         "flashlight" : {"name" : "Flashlight", "control_group" : "Lights", "value_type" : "switch", "default" : 0, "return_data" : "none"},
+         "camera_resolution" : {"name" : "Camera Resolution", "control_group" : "Camera Controls", "value_type" : "numeric_constrained", "min_value" : 10, "max_value" : 100, "return_data" : "none"}};
+   
+      var self = this;
+      var keyDownCode = -1;
+      var keyDownIntervalID = 0;
+      var commandInputFocused = false;
+      var currentCameraSliderValue = 0;
+      var controlWS;
+      var videoWS;
+      var currentIP;
+      var controlConnectionStatus = NOT_CONNECTED;
+      var videoConnectionStatus = NOT_CONNECTED;
+
+	if (!window.console) console = {};
+	console.log = console.log || function(){};
+	console.warn = console.warn || function(){};
+	console.error = console.error || function(){};
+	console.info = console.info || function(){};
+
+      document.observe("dom:loaded", function() {
+	
+		log("dom:loaded");
+      
+         // Setup Input Handlers
+         document.onkeypress = keyPress; 
+         document.onkeyup = keyUp;
+         document.onkeydown = keyDown;
+      
+         // Connection Form
+         $("connection_form").observe("submit", function(e) {
+            e.stop();
+
+            if (isDisconnected()) {
+				log("Is disconnected, so making connection...");
+               makeConnection();
+            } else if (isConnected() || isConnecting()) {
+				log("Is connected or isConnecting, so we will disconnect");
+               disconnect();
+            } 
+         });
+
+         // Lights Form
+         $('lights_form').childElements().each(
+            function(currButton) {
+               currButton.observe('click', self.lightsControlAction); 
+            }
+         );
+      
+         // Command Form
+         $("command_input").observe('focus', function(e) {
+            commandInputFocused = true;
+         });
+      
+         $("command_input").observe('blur', function(e) {
+            commandInputFocused = false;
+         });
+      
+         $("command_form").observe('submit', function(e) {
+            e.stop();
+            var textField = $("command_input");
+            var commandResponse = sendTextInstruction(textField.value);
+            textField.value = "";
+            if (LOG_COMMANDS_ENABLED) {
+               log(commandResponse + "\n");  
+            }
+         });
+      
+         // Camera Quality Slider 
+         var cameraSlider = $("camera_quality_slider");
+         currentCameraSliderValue = cameraSlider.value;
+         cameraSlider.observe('change', self.onCameraQualitySliderChange);
+
+      
+         $("take_picture_button").observe("click", function(e) {
+            e.stop();
+            log("take picture \n");
+         });
+      
+         $("save_picture_button").observe("click", function(e) {
+            e.stop();
+            log("save picture \n");
+         });
+         
+         $("hide_mission_goals_button").observe("click", function (e) {
+            hideMissionGoals();
+         }); 
+         
+         $("expand_mission_goals_button").observe("click", function (e) {
+            showMissionGoals();
+         });
+         
+         initializeView();
+   });
+
+   function log(text) {
+	console.log(text);
+      $("log").innerHTML = (new Date).getTime() + ": " + (!Object.isUndefined(text) && text !== null ? text.escapeHTML() : "null") + $("log").innerHTML;
+   }
+
+   function telemetry(text) {
+      $("telemetry").innerHTML = (new Date).getTime() + ": " + (!Object.isUndefined(text) && text !== null ? text.escapeHTML() : "null") + $("log").innerHTML;
+   }
+
+   function makeConnection() {
+      currentIP = $F("control_uri");
+      makeControlConnection();
+   
+   }
+
+   function makeControlConnection() {
+	log("in makeControlConnection");
+      controlConnectionStatus = CONNECTING;
+      connectionChanged();
+      var serverAddress = "ws://" + currentIP + ":8887"; // should get port from config file
+		log("serverAddress: " + serverAddress);
+      controlWS = new WebSocket(serverAddress);
+      controlWS.onopen = self.controlConnectionOpened;
+      controlWS.onmessage = self.controlConnectionMessage;
+      controlWS.onclose = self.controlConnectionClosed;
+   }
+
+   function makeVideoConnection() {
+      connectionChanged();
+      videoConnectionStatus = CONNECTING;
+      var serverAddress = "ws://" + currentIP + ":8886";  // should get port from config file
+       videoWS = new WebSocket(serverAddress);
+       videoWS.onopen = self.videoConnectionOpened;
+       videoWS.onmessage = self.videoConnectionMessage;
+       videoWS.onclose = self.videoConnectionClosed;
+   }
+
+   function disconnect() {
+      if (controlWS != null) {
+           controlWS.close();      
+      }
+     if (videoWS != null) {
+        videoWS.close();      
+     }
+     controlConnectionStatus = NOT_CONNECTED;
+     videoConnectionStatus = NOT_CONNECTED;
+     connectionChanged();
+   }
+
+   function controlConnectionOpened() {
+      controlConnectionStatus = CONNECTED;
+ 
+	log("controlConnectionOpened");
+
+      var jsonRequest = {SUBSCRIPTION_KEY : SUBSCRIPTION_VALUE_CONTROL};
+      var jsonString = Object.toJSON(jsonRequest);
+       if (controlWS) {
+           log("Making control request:  " + jsonString + "\n");
+           controlWS.send(jsonString);
+       }
+      
+	log("Trying to make Video Connection");
+      makeVideoConnection();
+      connectionChanged();
+   }
+
+   function controlConnectionMessage(e) {
+	telemetry(e.data.toString());
+   
+   }
+
+   function controlConnectionClosed() {
+      log("Control connection closed...\n");
+      controlConnectionStatus = NOT_CONNECTED;
+      connectionChanged();
+   }
+
+   function videoConnectionOpened() {
+      videoConnectionStatus = CONNECTED;
+      connectionChanged();
+   }
+
+   function videoConnectionMessage(e) {
+      var ctx = document.getElementById('video_canvas').getContext('2d');
+       var img = new Image();
+       img.onload = function(){
+         ctx.drawImage(img,0,0);
+       }
+       img.src = 'data:image/jpeg;base64,' + e.data;
+   }
+
+   function videoConnectionClosed() {
+      log("Control connection closed...\n");
+      videoConnectionStatus = NOT_CONNECTED;
+      connectionChanged();
+   }
+
+   function initiateConnection(uri) {
+      makeConnection(uri, this, this.connectionResponse);
+   }
+
+   function connectionResponse (didSucceed, errorMessage) {
+      updateViewForCurrConnectionStatus();
+      if (!didSucceed) {
+         alert("Could not establish connection:\n\n" + errorMessage);
+      }
+   }
+
+   function connectionChanged(errorMessage) {
+      updateViewForCurrConnectionStatus();
+   }
+
+   function videoReceived(videoFrame) {
+   
+   }
+
+   // Messaging functions
+
+   function sendTextInstruction(instruction) {
+      if (controlWS != null) {
+         var message = constructControlCommand(MISC_INSTRUCTION_KEY, instruction + "\r");
+         controlWS.send(message);
+      }
+      return instruction + "\r";
+   }
+
+   function sendKeypressInstruction(controlAttribute, keypressInstruction) {
+      var commandString = "";
+      if (controlWS != null) {
+         commandString = keypressInstruction; //"J" + keypressInstruction + "\r";
+         var message = constructControlCommand(controlAttribute, commandString); 
+         controlWS.send(message);
+      }
+      return commandString;
+   }
+
+   function sendValueInstruction(controlAttribute, controlValue) {
+
+         if (controlWS != null) {            
+            var message = constructControlCommand(controlAttribute, controlValue); 
+            controlWS.send(message);
+         }
+         return controlValue + "\r";
+   }
+   
+   /**
+   * 
+   * @return commandID (in the future commandID will be used to provide status on issued commands)
+   */
+   function dotimedate(controlObjectID, controlValue) {
+   
+      // Using time to generate uniqueID for now...
+      var newDate = new Date;
+      return newDate.getTime();
+   
+   }
+
+
+   // View Management
+
+   function initializeView() {
+      drawWADS(-1, $("movement_control_canvas"), FLIP_DRIVE_AXIS);
+      drawWADS(-1, $("camera_control_canvas"), FLIP_CAMERA_AXIS);
+   
+      $("image_quality_percentage").update(currentCameraSliderValue + "%");
+      
+      showMissionGoals();
+   }
+   
+   function showMissionGoals() {
+      $("mission_goals_div").removeClassName("hidden_mission_goals");
+      $("mission_goals_div").addClassName("expanded_mission_goals");
+      $("controls_div").removeClassName("expanded_controls");
+      $("controls_div").addClassName("hidden_controls");
+   }
+
+   function hideMissionGoals() {
+      $("mission_goals_div").addClassName("hidden_mission_goals");
+      $("mission_goals_div").removeClassName("expanded_mission_goals");
+       $("controls_div").removeClassName("hidden_controls");
+      $("controls_div").addClassName("expanded_controls");
+   }
+   
+   function updateViewForCurrConnectionStatus() {
+      if (isConnected()) {
+         $("connection_cell_background").removeClassName("not_connected_background");
+         $("connection_cell_background").removeClassName("connecting_background");
+         $("connection_cell_background").addClassName("connected_background");
+         $("connection_cell_background").addClassName("animate_opacity");
+         $('connection_status_text').update('Connected');
+         $("control_connect_input").value = "Disconnect";
+      } else if (isConnecting()){
+         $('connection_status_text').update('Connecting...');
+         $("connection_cell_background").removeClassName("not_connected_background");
+         $("connection_cell_background").removeClassName("connected_background");
+         $("connection_cell_background").addClassName("animate_opacity");
+         $("connection_cell_background").addClassName("connecting_background");
+         $("control_connect_input").value = "Cancel";        
+      } else if (isDisconnected()){
+         $('connection_status_text').update('Not Connected');
+         $("connection_cell_background").removeClassName("connected_background");
+         $("connection_cell_background").removeClassName("connecting_background");
+         $("connection_cell_background").removeClassName("animate_opacity");
+         $("connection_cell_background").addClassName("not_connected_background");
+         $("control_connect_input").value = "Make Connection";        
+      }
+   }
+
+   // Input Handling
+   function lightsControlAction(event) {
+
+      var value = event.target.value;
+      var controlObjectID = null;
+      var controlValue = null;
+   
+      if (value == "uv_on") {
+         controlObjectID = "uv_light";
+         controlValue = 1;
+      } else if (value == "uv_off") {
+         controlObjectID = "uv_light";
+         controlValue = 0;
+      } else if (value == "flashlight_on") {
+         controlObjectID = "flashlight";
+         controlValue = 1;
+      } else if (value == "flashlight_off") {
+         controlObjectID = "flashlight";
+         controlValue = 0;
+      }
+
+      var commandResponse = sendTextInstruction(controlObjectID+","+controlValue);
+
+   
+      var commandID = dotimedate(controlObjectID, controlValue);
+      if (LOG_COMMAND_IDS_ENABLED) {
+         log(commandID + "\n");
+      }
+   }
+
+   function onCameraQualitySliderChange(event) {
+       var cameraSlider = $("camera_quality_slider");
+       if (cameraSlider.value != currentCameraSliderValue) {
+          currentCameraSliderValue = cameraSlider.value;
+          var commandID = dotimedate("camera_resolution", currentCameraSliderValue);
+          if (LOG_COMMANDS_ENABLED) {
+             log("cameraSlider change:  " + currentCameraSliderValue + "\n");
+          }
+          if (LOG_COMMAND_IDS_ENABLED) {
+               log(commandID + "\n");
+          }
+          if (videoWS != null) {
+            var message = constructControlCommand(IMAGE_RESOLUTION_KEY, currentCameraSliderValue);
+            videoWS.send(message);
+          }
+          $("image_quality_percentage").update(currentCameraSliderValue + "%");
+       }
+   }
+
+   function constructControlCommand(controlAttribute, value) {
+      return Object.toJSON({CONTROL_ATTRIBUTE_KEY : controlAttribute, CONTROL_VALUE_KEY: value});
+   }
+
+   function keyPress(e) {
+
+      var keyID = (window.event) ? event.keyCode : e.keyCode;
+      var canvas = $('movement_control_canvas');
+      var textField = $("command_input");
+      var wadsCode = -1;
+      var commandResponse = "key:  " + keyID + "\n";
+
+      if (keyID == 13 || keyID == 10) {
+         if (textField.value=="") {
+            textField.focus(); 
+         } else if (textField.value != "" && commandInputFocused) {
+            commandResponse = sendTextInstruction(textField.value);
+            textField.value="";
+         } else {
+            textField.focus();
+         }
+         e.preventDefault()
+         wadsCode = -1;
+
+      } else if (!commandInputFocused) {
+         wadsCode = commandIDForKeyID(keyID);
+
+         if (wadsCode > 0) {
+            commandResponse = sendKeypressInstruction(DIRECTION_CONTROL_KEY, wadsCode);
+            drawWADS(wadsCode, canvas, FLIP_DRIVE_AXIS);
+         }
+      }
+
+      if (LOG_COMMANDS_ENABLED) {
+         log(commandResponse);
+      }
+   }
+
+    function keyUp(e) {
+        drawWADS(-1, $('movement_control_canvas'), FLIP_DRIVE_AXIS);
+        drawWADS(-1, $('camera_control_canvas'), FLIP_CAMERA_AXIS);
+        if (keyDownCode > 0) {
+           clearInterval(keyDownIntervalID);
+           keyDownCode = -1;
+        }
+    }
+ 
+    function keyDown(e) {
+      var keyID = (window.event) ? event.keyCode : e.keyCode;
+      var watchKeyPress = false;
+   
+      switch(keyID) {
+         case 37:
+         case 38:
+         case 39:
+         case 40:
+         watchKeyPress = true;
+         if (isConnected()) {
+            e.preventDefault();         
+         }
+         break;
+      
+         default:
+         watchKeyPress = false;
+      }
+
+       // attempt at manually implementing onKeyPress for other keys...
+       if (watchKeyPress && keyDownCode < 0) {
+          keyDownCode = keyID;
+          keyDownIntervalID = setInterval('keyDownTimerCallback()', 80);
+       }
+    }
+ 
+    function keyDownTimerCallback() {
+       var commandID = commandIDForKeyID(keyDownCode);
+       var translatedValue = 0;
+       var controlAttribute;
+       if (commandID == 2) {
+          controlAttribute = TILT_CONTROL_KEY;
+          translatedValue = - CAMERA_MOVEMENT_AMOUNT;
+       } else if (commandID == 8) {
+          controlAttribute =  TILT_CONTROL_KEY;
+          translatedValue =  CAMERA_MOVEMENT_AMOUNT;
+       } else if (commandID == 4) {
+          controlAttribute = PAN_CONTROL_KEY;
+          translatedValue =  - CAMERA_MOVEMENT_AMOUNT;
+       } else if (commandID == 6) {
+          controlAttribute = PAN_CONTROL_KEY;
+           translatedValue = CAMERA_MOVEMENT_AMOUNT;
+       }
+       
+       
+       if (translatedValue > 0 || translatedValue < 0) {
+          var commandResponse = sendValueInstruction(controlAttribute, translatedValue);
+          if (LOG_COMMANDS_ENABLED) {
+             log(commandResponse);
+          }
+       
+          drawWADS(commandID  , $('camera_control_canvas'), FLIP_CAMERA_AXIS);
+       }
+    }
+ 
+    function commandIDForKeyID(keyID) {
+       var commandID = -1;
+       
+      
+    
+       switch (keyID) {
+          case 49:
+          case 122:
+            commandID = 1;
+            break;
+          case 38:
+          case 50:
+          case 115:
+            commandID = 2;
+            break;
+          case 51:
+          case 99:
+            commandID = 3;
+            break;
+          case 37:
+          case 52:
+          case 97:
+            commandID = 4;
+            break;
+          case 53:
+            commandID = 5;
+            break;
+          case 39:
+          case 54:
+          case 100:
+            commandID = 6;
+            break;
+          case 55:
+          case 113:
+            commandID = 7;
+            break;
+          case 40:
+          case 56:
+          case 119:
+            commandID = 8;
+            break;
+          case 57:
+          case 101:
+            commandID = 9;
+            break;   
+          default:
+            commandID = -1;
+       }
+       
+        log ("key: " + keyID  + " command: " + commandID + "\n");
+       return commandID;
+    }
+
+   function isConnected() {
+      return controlConnectionStatus == CONNECTED && videoConnectionStatus == CONNECTED;
+   }   
+
+   function isConnecting() {
+      return controlConnectionStatus == CONNECTING || videoConnectionStatus == CONNECTING;
+   }
+
+   function isDisconnected() {
+      return controlConnectionStatus == NOT_CONNECTED && videoConnectionStatus == NOT_CONNECTED;
+   }
+
+   </script>
+   </head>
+   <body>
+
+      <div id="container">
+         <div id="header">
+            <h1>
+               Exploration Uplink
+            </h1>
+         </div>
+         <div id="navigation">
+            <ul>
+               <li><a href="#">____</a></li>
+             
+               
+            </ul>
+
+         </div>
+         <div id="content-container">
+
+            <!-- Left Section -->
+            <div id="section-navigation">
+               <div class="section_grouping">
+                  <div class="section-description-title">
+                     Rover:
+                  </div>
+                  <table class="table_section">
+                     <tr>
+                        <td>
+
+                           <div class="section-title">
+                              __--___--
+                           </div>
+                        </td>
+                     </tr>
+                     <tr>
+                        <td class="bordered_cell">
+                           <img src="images/x_uplink_rover_small.jpg">
+                        </td>
+                     </tr>
+                  </table>
+               </div>   
+               <div class="section_grouping">
+                  <div class="section-description-title">
+                     Connection Status:
+
+                  </div>
+                  <table class="table_section">
+                     <tr>
+                        <td id="connected_cell" class="bordered_cell">
+                           <!-- alternate between class="not_connected_background" and class="connected_background animate_opacity" --> 
+                           <div id="connection_cell_background" class="not_connected_background">
+                           </div>           	   
+                           <div id="connection_status_text" class="connected_text">
+                              Not Connected
+                           </div>
+                        </td>
+                     </tr>
+                     <tr>
+                        <td>
+                           <form id="connection_form" class="text_center">
+                              <input type="text" id="control_uri" value="192.168.0.143">
+                              <input type="submit" id="control_connect_input" value="Make Connection">
+                           </form>
+                        </td>
+                     </tr>
+                  </table>
+               </div>
+
+            </div>
+            
+            <div id="mission_goals_div">
+                  <div class="section_grouping">
+                       <div class="section-description-title">
+                          Mission goals:
+                       </div>
+                       <table class="table_section">
+                          <tr>
+                             <td class="bordered_cell">
+                                <div id="mission_goals">
+                                   <ul>
+                                      <li>Use the rover to locate a meteorite in the lunar landscape</li>
+                                      <li>Take high resolution images of potential meteorite objects for later analysis </li>
+                                   </ul>
+                                </div>
+                             </td>
+                          </tr>
+                          <tr> 
+                             <td id="hide_mission_goals_div">
+                                <input id="hide_mission_goals_button" type="button" value="Show Controls">
+                             </td>
+                          </tr>
+                       </table>
+                    </div>
+            </div>   
+            
+            <div id="controls_div">
+
+               <!-- Center Section -->
+               
+               <div id="content">
+                  <div class="section_grouping">
+                     <div class="section-description-title">
+                        Mission Goals:
+                     </div>
+                     <table class="table_section">
+                         <tr>
+
+                              <td class="bordered_cell">
+                                 <ol>
+                                      <li>Locate Meteorite</li>
+                                      <li>Capture Image </li>
+                                   </ol>
+                              </td>
+                           </tr>
+                        <tr>
+                           <td class="text_right">
+                              <input type="button" id="expand_mission_goals_button" value="Expand">
+                           </td>
+                        </tr>
+    
+                        </table>
+                     </div>
+                  <div class="section_grouping">
+                     <div class="section-description-title">
+                        Camera:
+                     </div>
+                     <table class="table_section">
+                        <tr>
+                           <td>
+                              <form id="camera_form">
+                                 <input type="button" class="camera_button" id="take_picture_button" value="Take Picture">
+                                 <input type="button" class="camera_button" id="save_picture_button" value="Save Picture">                                   
+                              </form>
+                           </td>
+                        </tr>
+                        <tr>
+
+                           <td class="bordered_cell">
+                              <div id="saved_image_div">
+
+                              </div>
+                           </td>
+                        </tr>
+                        <tr>
+                           <td class="bordered_cell">   
+                              Image Quality:
+                              <input id="camera_quality_slider" type="range" min="10" max="100" value="20" step="10" />
+                              <span id="image_quality_percentage">
+                                 20%
+                              </span>
+                           </td>
+                        </table>
+                     </div>
+
+                     <div class="section_grouping">
+                        <div class="section-description-title">
+                           Lights:
+                        </div>
+                        <form id="lights_form">
+                           <table class="table_section">
+                              <tr>
+                                 <td class="bordered_cell">
+                                    <table>
+                                       <tr>
+                                          <td></td>
+                                          <td class="text_left">ON</td>
+                                          <td class="text_left">OFF</td>
+                                       </tr>
+                                       
+                                    <!-- 
+                                       <tr>
+
+                                          <td class="light_title">UV Light</td>
+                                          <td><input type="radio" name="uv_light_controls" value ="uv_on"  class="radio_input" id="uv_light_on"></td>
+                                          <td><input type="radio" name="uv_light_controls" value="uv_off" class="radio_input" id="uv_light_off" checked></td>
+
+                                       </tr>
+                                       -->
+                                       <tr>
+
+                                          <td class="light_title">Flashlight</td>
+                                          <td><input type="radio" name="flashlight_controls" value="flashlight_on" class="radio_input" id="flashlight_on" ></td>
+                                          <td><input type="radio" name="flashlight_controls" value="flashlight_off" class="radio_input" id="flashlight_off" checked></td>
+
+                                       </tr>
+                                    </table>
+
+                                 </tr>
+
+                              </table>
+                           </form>
+                        </div>
+
+                        <div class="section_grouping">
+                           <div class="section-description-title">
+                              Command:
+                           </div>
+                           <table class="table_section">
+
+                              <tr>
+                                 <td>
+                                    <form id="command_form">
+                                       <input type="text" id="command_input" value="" style="width:75%;"> 
+                                       <input type="submit" id="command_submit" value="Send">
+                                    </form>
+                                 </td>
+                              </tr>
+                           </table>
+                        </div>
+                     
+                         <div class="section_grouping">
+                              <div class="section-description-title">
+                                 Log:
+                              </div>
+                              <table class="table_section">
+                                 <tr>
+                                    <td class="bordered_cell">           	   
+                                       <textarea id="log" ></textarea>
+                                    </td>
+                                 </tr>
+                              </table>
+                        </div>
+
+                     </div>
+
+                     <!-- Right Section -->
+
+                     <div id="aside">
+                        <div class="section_grouping">
+                           <div class="section-description-title">
+                              Video feed:
+                           </div>
+
+                           <div id="video_div">
+                              <canvas id="video_canvas"></canvas>
+                           </div>
+                           <div id="motor_control_div">
+                              <table id="directional_control" class="table_section">
+                                 <tr>
+                                    <td class="movement_control_title">
+                                       Driving
+                                    </td>
+                                    <td class="movement_control_title">
+                                       Camera Position
+                                    </td>
+                                 </tr>
+                                 <tr>
+                                    <td id="movement_control_cell" class="bordered_cell">
+                                       <canvas id="movement_control_canvas" class="directional_canvas" width="80" height="80"></canvas>
+                                    </td>
+                                    <td id="camera_control_cell" class="bordered_cell">
+                                       <canvas id="camera_control_canvas" class="directional_canvas" width="80" height="80"></canvas>
+                                    </td>
+                                 </tr>
+                              </table>
+
+
+                           </div>
+                        </div>
+
+
+
+
+                         <div class="section_grouping">
+                              <div class="section-description-title">
+                                 Telemetry:
+                              </div>
+                              <table class="table_section">
+                                 <tr>
+                                    <td class="bordered_cell">           	   
+                                       <textarea id="telemetry" ></textarea>
+                                    </td>
+                                 </tr>
+                              </table>
+                        </div>
+
+
+
+                     </div>
+                  </div>
+                  <div id="footer">
+                     Copyright © Exploration Uplink, 2011
+                  </div>
+               </div>
+            </div>
+
+         </body>
+         </html>

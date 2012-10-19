@@ -1,0 +1,67 @@
+10
+
+dir
+12
+svn://phinominal.com/home/spiritpl/public_html/svn/phinominal/ExplorationUplink/.metadata/.plugins
+svn://phinominal.com/home/spiritpl/public_html/svn/phinominal
+
+
+
+2011-02-15T09:27:05.513389Z
+5
+phinominal
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+f871c16d-b323-45dc-aa47-a37d617665d0
+
+org.eclipse.wst.internet.cache
+dir
+
+org.eclipse.team.cvs.core
+dir
+
+org.eclipse.jdt.core
+dir
+
+org.eclipse.core.runtime
+dir
+
+org.eclipse.epp.usagedata.recording
+dir
+
+org.eclipse.jdt.ui
+dir
+
+org.eclipse.ui.ide
+dir
+
+org.eclipse.ui.workbench
+dir
+
+org.eclipse.jdt.junit.core
+dir
+
+org.eclipse.core.resources
+dir
+
+org.eclipse.debug.ui
+dir
+
+org.eclipse.jdt.debug.ui
+dir
+
+org.eclipse.wst.sse.ui
+dir
+
